@@ -46,7 +46,7 @@ fn main() -> Result<()> {
         match res {
             Ok(msg) => eprintln!("[OK] {msg}"),
             Err(e) => {
-                eprintln!("[ERR] {e}");
+                eprintln!("{e}");
                 // eprintln!("{e}", e = e.backtrace());
             }
         }
@@ -81,14 +81,86 @@ fn parse_file(
         bail!("Invalid file name {fname}")
     };
     if periph_type.ends_with("_ex") {
-        bail!("This is an extension module")
+        bail!("Skipping extension module, already processed in main module")
+    }
+    if !["hal", "ll"].contains(&hal_type) {
+        bail!("Invalid hal_type {fname}");
     }
 
     let hdr = parse_header(index, db, &file).context("Could not parse the file")?;
     // dbg!(hdr.get_diagnostics());
     let functions = find_functions(hdr.get_entity().get_children()).collect_vec();
 
-    let handle_type = if hal_type == "hal" {
+    let handle_types = find_handle_types(hal_type, &hdr, periph_type, &functions);
+
+    let gen_code = generate_code(handle_types, ofname, periph_type, &functions, hal_type)?;
+
+    let new_file = outdir.join(fname).with_extension("hpp");
+    {
+        let file = File::create(&new_file).context("Could not create new file")?;
+        let mut file = BufWriter::new(file);
+        file.write_all(gen_code.as_bytes())?;
+    }
+
+    Ok(format!(
+        "{} converted to {}",
+        file.display(),
+        new_file.display()
+    ))
+}
+
+fn generate_code(
+    handle_types: Vec<String>,
+    ofname: &str,
+    periph_type: &str,
+    functions: &[sonar::Declaration],
+    hal_type: &str,
+) -> Result<String, Error> {
+    use std::fmt::Write;
+    let mut code = String::new();
+    writeln!(code, "#pragma once")?;
+    writeln!(code, "#include \"{ofname}.h\"")?;
+    writeln!(code, "namespace {hal_type} {{")?;
+    if handle_types.is_empty() {
+        let cname = periph_type.to_case(Case::Pascal);
+        writeln!(code, "namespace {cname} {{")?;
+        code.extend(static_functions(functions, hal_type, periph_type));
+        writeln!(code, "}};")?;
+    } else {
+        for handle_type in handle_types {
+            let Some((cname, _)) = handle_type.rsplit_once('_') else {
+                eprintln!("Weird handle type {handle_type}");
+                continue;
+            };
+            let cname = cname.to_case(Case::Pascal);
+            // TODO: version that extends the struct rather than storing a handle
+            writeln!(code, "class {cname} {{")?;
+            writeln!(code, "public:")?;
+            writeln!(code, "{handle_type} handle;")?;
+            writeln!(
+                code,
+                "{cname}({handle_type} _handle) : handle(_handle) {{}}"
+            )?;
+            code.extend(handle_functions(
+                functions,
+                &handle_type,
+                hal_type,
+                periph_type,
+            ));
+            writeln!(code, "}};")?;
+        }
+    }
+    writeln!(code, "}};")?;
+    Ok(code)
+}
+
+fn find_handle_types(
+    hal_type: &str,
+    hdr: &clang::TranslationUnit,
+    periph_type: &str,
+    functions: &[sonar::Declaration],
+) -> Vec<String> {
+    let handle_types = if hal_type == "hal" {
         find_structs(hdr.get_entity().get_children())
             .map(|decl| decl.name)
             .filter(|decl| decl.ends_with("_HandleTypeDef"))
@@ -115,61 +187,20 @@ fn parse_file(
             .unique()
             .collect_vec()
     } else {
-        bail!("Invalid hal_type {fname}");
+        unreachable!("Unknown hal_type {hal_type}");
     };
-    if handle_type.is_empty() {
-        bail!("No handle type found")
-        // TODO: just namespace the functions?
-    };
-
-    let class_code = {
-        use std::fmt::Write;
-        let mut class_code = String::new();
-        writeln!(class_code, "#pragma once")?;
-        writeln!(class_code, "#include \"{ofname}.h\"")?;
-        writeln!(class_code, "namespace {hal_type} {{")?;
-        for handle_type in handle_type {
-            let Some(split_once) = handle_type.rsplit_once('_') else {
-                continue;
-            };
-            let cname = split_once.0.to_case(Case::Pascal);
-            // TODO: version that extends the struct rather than storing a handle
-            writeln!(class_code, "class {cname} {{")?;
-            writeln!(class_code, "public:")?;
-            writeln!(class_code, "{handle_type} handle;")?;
-            writeln!(
-                class_code,
-                "{cname}({handle_type} _handle) : handle(_handle) {{}}"
-            )?;
-            class_code.extend(body_functions(&functions, &handle_type, periph_type));
-            writeln!(class_code, "}};")?;
-        }
-        writeln!(class_code, "}};")?;
-        class_code
-    };
-
-    let new_file = outdir.join(fname).with_extension("hpp");
-    {
-        let file = File::create(&new_file).context("Could not create new file")?;
-        let mut file = BufWriter::new(file);
-        file.write_all(class_code.as_bytes())?;
-    }
-
-    Ok(format!(
-        "{} converted to {}",
-        file.display(),
-        new_file.display()
-    ))
+    handle_types
 }
 
-fn body_functions(
+fn handle_functions(
     functions: &[sonar::Declaration],
     handle_type: &str,
+    hal_type: &str,
     periph: &str,
 ) -> Vec<String> {
-    let is_ll = !handle_type.contains("Handle");
+    let is_ll = hal_type == "ll";
     let handle_type = handle_type.strip_prefix("__").unwrap_or(handle_type);
-    let periph_up = periph.to_uppercase();
+    let periph_up = &periph.to_uppercase();
     functions
         .iter()
         .filter(|decl| {
@@ -184,17 +215,15 @@ fn body_functions(
                     .get_result_type()
                     .expect("known function")
                     .get_display_name();
-                // TODO: convert StatusTypeDef into bool
                 let oname = &decl.name;
                 let name = oname.split_once('_')?.1;
-                let name = name.strip_prefix(&periph_up).unwrap_or(name);
-                let name = name.strip_prefix("_").unwrap_or(name);
+                let name = name.replace(&(periph_up.clone() + "_"), "");
                 let name = &name.to_case(Case::Snake);
                 let name = name.strip_prefix(periph).unwrap_or(name);
                 let name = name.strip_prefix("_").unwrap_or(name);
                 let mut args = decl.entity.get_arguments().expect("known function");
                 if args.is_empty() {
-                    if oname.contains(periph) {
+                    if oname.contains(periph_up) {
                 return format!(
                     "\tstatic inline {ret_type} {name}() {{ return {oname}(); }}\n"
                 )
@@ -211,7 +240,7 @@ fn body_functions(
                     args.remove(0);
                     ("", vec!["this->handle".into()])
                 }
-                else if oname.contains(periph) {
+                else if oname.contains(periph_up) {
                     ("static ", vec![])
                 }
                 else {
@@ -230,6 +259,52 @@ fn body_functions(
 
                 format!(
                     "\t{prefix}inline {ret_type} {name}({args}) {{ return {oname}({call_args}); }}\n"
+                )
+            };
+            code.unwrap_or_default()
+        })
+        .collect_vec()
+}
+
+fn static_functions(functions: &[sonar::Declaration], hal_type: &str, periph: &str) -> Vec<String> {
+    let is_ll = hal_type == "ll";
+    let periph_up = &periph.to_uppercase();
+    functions
+        .iter()
+        .filter(|decl| {
+            (!is_ll && decl.name.starts_with("HAL_")) || (is_ll && decl.name.starts_with("LL_"))
+        })
+        .filter(|decl| !decl.name.ends_with("IRQHandler") && !decl.name.ends_with("Callback"))
+        .rev()
+        .map(|decl| {
+            let code: Option<String> = try {
+                let ret_type = decl
+                    .entity
+                    .get_result_type()
+                    .expect("known function")
+                    .get_display_name();
+                // TODO: convert StatusTypeDef into bool
+                let oname = &decl.name;
+                if !oname.contains(periph_up) {
+                    return String::new();
+                }
+                let name = oname.split_once('_')?.1;
+                let name = name.replace(&(periph_up.clone() + "_"), "");
+                let name = &name.to_case(Case::Snake);
+                let name = name.strip_prefix(periph).unwrap_or(name);
+                let name = name.strip_prefix("_").unwrap_or(name);
+                let args = decl.entity.get_arguments().expect("known function");
+                let call_args = args
+                    .iter()
+                    .map(|arg| arg.get_name().expect("args have names"))
+                    .join(", ");
+                let args = args
+                    .into_iter()
+                    .map(|arg| arg.get_pretty_printer().print())
+                    .join(", ");
+
+                format!(
+                    "\tstatic inline {ret_type} {name}({args}) {{ return {oname}({call_args}); }}\n"
                 )
             };
             code.unwrap_or_default()
