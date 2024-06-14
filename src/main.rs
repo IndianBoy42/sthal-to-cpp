@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Error, Result};
 use clang::sonar::{find_functions, find_structs, find_typedefs};
-use clang::{sonar, CompilationDatabase, Index};
+use clang::{sonar, CompilationDatabase, Index, Type};
 use clang::{Clang, Parser};
 use clap::Parser as ClapParser;
 use convert_case::{Case, Casing};
@@ -93,7 +93,12 @@ fn parse_file(
 
     let handle_types = find_handle_types(hal_type, &hdr, periph_type, &functions);
 
-    let gen_code = generate_code(handle_types, ofname, periph_type, &functions, hal_type)?;
+    let inc_name = if hal_type == "hal" {
+        &format!("{stver}_hal")
+    } else {
+        ofname
+    };
+    let gen_code = generate_code(handle_types, inc_name, periph_type, &functions, hal_type)?;
 
     let new_file = outdir.join(fname).with_extension("hpp");
     {
@@ -110,8 +115,8 @@ fn parse_file(
 }
 
 fn generate_code(
-    handle_types: Vec<String>,
-    ofname: &str,
+    handle_types: Vec<(String, Type)>,
+    inc_name: &str,
     periph_type: &str,
     functions: &[sonar::Declaration],
     hal_type: &str,
@@ -119,31 +124,42 @@ fn generate_code(
     use std::fmt::Write;
     let mut code = String::new();
     writeln!(code, "#pragma once")?;
-    writeln!(code, "#include \"{ofname}.h\"")?;
+    writeln!(code, "#include \"{inc_name}.h\"")?;
+    // if hal_type == "hal" {
+    //     writeln!(code, "#include \"ll_{periph_type}.hpp\"")?;
+    // }
     writeln!(code, "namespace {hal_type} {{")?;
     if handle_types.is_empty() {
-        let cname = periph_type.to_case(Case::Pascal);
+        let cname = periph_type.to_case(Case::UpperCamel);
         writeln!(code, "namespace {cname} {{")?;
         code.extend(static_functions(functions, hal_type, periph_type));
         writeln!(code, "}};")?;
     } else {
-        for handle_type in handle_types {
-            let Some((cname, _)) = handle_type.rsplit_once('_') else {
-                eprintln!("Weird handle type {handle_type}");
+        for (handle_typename, _) in handle_types {
+            let Some((cname, _)) = handle_typename.rsplit_once('_') else {
+                eprintln!("Weird handle type {handle_typename}");
                 continue;
             };
-            let cname = cname.to_case(Case::Pascal);
+            let cname = cname.to_case(Case::UpperCamel);
             // TODO: version that extends the struct rather than storing a handle
             writeln!(code, "class {cname} {{")?;
             writeln!(code, "public:")?;
-            writeln!(code, "{handle_type} handle;")?;
+            writeln!(code, "{handle_typename} {periph_type};")?;
             writeln!(
                 code,
-                "{cname}({handle_type} _handle) : handle(_handle) {{}}"
+                "{cname}({handle_typename} {periph_type}) : {periph_type}({periph_type}) {{}}"
             )?;
+            // if hal_type == "hal" {
+            //     writeln!(code, "template <bool dummy=true>")?;
+            //     writeln!(
+            //         code,
+            //         "ll::{cname} ll() {{ return ll::{cname}{{ {periph_type}->Instance }}; }}"
+            //     )?;
+            // }
+            // TODO: add virtual functions for callbacks
             code.extend(handle_functions(
                 functions,
-                &handle_type,
+                &handle_typename,
                 hal_type,
                 periph_type,
             ));
@@ -154,38 +170,44 @@ fn generate_code(
     Ok(code)
 }
 
-fn find_handle_types(
+fn find_handle_types<'a>(
     hal_type: &str,
-    hdr: &clang::TranslationUnit,
+    hdr: &'a clang::TranslationUnit<'a>,
     periph_type: &str,
-    functions: &[sonar::Declaration],
-) -> Vec<String> {
+    functions: &'a [sonar::Declaration<'a>],
+) -> Vec<(String, Type<'a>)> {
     let handle_types = if hal_type == "hal" {
         find_structs(hdr.get_entity().get_children())
-            .map(|decl| decl.name)
-            .filter(|decl| decl.ends_with("_HandleTypeDef"))
-            .filter(|decl| decl.to_lowercase().contains(&periph_type.to_lowercase()))
-            .filter(|decl| !decl.contains("const"))
-            .map(|decl| decl + " *")
+            .map(|decl| (decl.name, decl.entity.get_type().expect("Known type")))
+            .filter(|(decl, _)| decl.ends_with("_HandleTypeDef"))
+            .filter(|(decl, _)| decl.to_lowercase().contains(&periph_type.to_lowercase()))
+            .filter(|(decl, _)| !decl.contains("const"))
+            .map(|(decl, ty)| (decl + " *", ty))
             .collect_vec()
     } else if hal_type == "ll" {
         functions
             .iter()
             .filter(|decl| decl.name.contains(&periph_type.to_uppercase()))
             .filter_map(|decl| try {
-                decl.entity
+                let ty = decl
+                    .entity
                     .get_arguments()
                     .expect("known function")
                     .first()?
                     .get_type()
-                    .expect("args have types")
-                    .get_display_name()
+                    .expect("args have types");
+                (ty.get_display_name(), ty)
             })
-            .filter(|name| name.contains("_TypeDef"))
+            .filter(|(name, _)| name.contains("_TypeDef"))
             // .filter(|decl| decl.contains(&periph_type.to_uppercase()))
-            .filter(|decl| !decl.contains("const"))
-            .unique()
-            .collect_vec()
+            .filter(|(decl, _)| !decl.contains("const"))
+            .filter(|(decl, _)| decl.to_lowercase().contains(&periph_type.to_lowercase()))
+            .fold(vec![], |mut types, (name, ty)| {
+                if types.iter().all(|(n, _)| n != &name) {
+                    types.push((name, ty));
+                }
+                types
+            })
     } else {
         unreachable!("Unknown hal_type {hal_type}");
     };
@@ -196,11 +218,11 @@ fn handle_functions(
     functions: &[sonar::Declaration],
     handle_type: &str,
     hal_type: &str,
-    periph: &str,
+    periph_type: &str,
 ) -> Vec<String> {
     let is_ll = hal_type == "ll";
     let handle_type = handle_type.strip_prefix("__").unwrap_or(handle_type);
-    let periph_up = &periph.to_uppercase();
+    let periph_up = &periph_type.to_uppercase();
     functions
         .iter()
         .filter(|decl| {
@@ -218,31 +240,32 @@ fn handle_functions(
                 let oname = &decl.name;
                 let name = oname.split_once('_')?.1;
                 let name = name.replace(&(periph_up.clone() + "_"), "");
-                let name = &name.to_case(Case::Snake);
-                let name = name.strip_prefix(periph).unwrap_or(name);
+                let name = &name.to_case(Case::Camel);
+                let name = name.strip_prefix(periph_type).unwrap_or(name);
                 let name = name.strip_prefix("_").unwrap_or(name);
                 let mut args = decl.entity.get_arguments().expect("known function");
                 if args.is_empty() {
-                    if oname.contains(periph_up) {
-                return format!(
-                    "\tstatic inline {ret_type} {name}() {{ return {oname}(); }}\n"
-                )
-                    }
+                //     if oname.contains(periph_up) {
+                // return format!(
+                //     "\tstatic inline {ret_type} {name}() {{ return {oname}(); }}\n"
+                // )
+                //     }
                     return String::new();
                 }
                 let first = args[0];
-                let (prefix, handle) = if first
+                let arg_type = &first
                     .get_type()
                     .expect("args have types")
-                    .get_display_name()
-                    .contains(handle_type)
+                    .get_display_name();
+                let (prefix, handle) = if arg_type
+                    .starts_with(handle_type) || arg_type.strip_prefix("const ").map_or(false, |arg_type| arg_type.starts_with(handle_type))
                 {
                     args.remove(0);
-                    ("", vec!["this->handle".into()])
+                    ("", vec![format!("this->{periph_type}")])
                 }
-                else if oname.contains(periph_up) {
-                    ("static ", vec![])
-                }
+                // else if oname.contains(periph_up) {
+                //     ("static ", vec![])
+                // }
                 else {
                     return String::new();
                 };
@@ -290,7 +313,7 @@ fn static_functions(functions: &[sonar::Declaration], hal_type: &str, periph: &s
                 }
                 let name = oname.split_once('_')?.1;
                 let name = name.replace(&(periph_up.clone() + "_"), "");
-                let name = &name.to_case(Case::Snake);
+                let name = &name.to_case(Case::Camel);
                 let name = name.strip_prefix(periph).unwrap_or(name);
                 let name = name.strip_prefix("_").unwrap_or(name);
                 let args = decl.entity.get_arguments().expect("known function");
